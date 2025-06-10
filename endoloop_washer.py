@@ -16,8 +16,8 @@ except ImportError:
         LOW = 0
         BCM = 0
         BOARD = 1
-        PUD_DOWN = 2  # Add the missing PUD_DOWN constant
-        PUD_UP = 3    # Add PUD_UP for completeness
+        PUD_DOWN = 2
+        PUD_UP = 3
         
         @staticmethod
         def setmode(mode):
@@ -54,22 +54,12 @@ except ImportError:
 
 import platform
 import subprocess
-
-# Untuk Windows
-try:
-    import win32print
-    import win32api
-except ImportError:
-    win32print = None
-    win32api = None
-
 import time
 import threading
-
 from tkinter.simpledialog import askstring
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from tkcalendar import DateEntry  # Tambahkan di bagian imports (pip install tkcalendar)
+from tkcalendar import DateEntry
 import os
 from datetime import datetime, timedelta
 
@@ -87,13 +77,22 @@ try:
 except ImportError:
     barcode = None
 
+# Untuk Windows
+try:
+    import win32print
+    import win32api
+except ImportError:
+    win32print = None
+    win32api = None
+
 # --- Constants ---
-PHASES = ['Detergent Wash', 'Rinsing', 'Disinfecting', 'Final Rinse']
+PHASES = ['Detergent Wash', 'Rinsing', 'Disinfecting', 'Final Rinse', 'Air-flush']
 PHASE_PINS = {
     'Detergent Wash': 18,
     'Rinsing': 17,
     'Disinfecting': 27,
-    'Final Rinse': 22
+    'Final Rinse': 22,
+    'Air-flush': 12  # New pin for Air-flush phase
 }
 LED_PINS = {
     'status': 5,
@@ -102,38 +101,19 @@ LED_PINS = {
 BUZZER_PIN = 13
 
 # Valve dan pump pins
-INLET_VALVE_PIN = 23  # Pin untuk inlet valve
-DRAIN_VALVE_PIN = 24  # Pin untuk drain valve
-WATER_PUMP_PIN = 25   # Pin untuk water pump
-WATER_LEVEL_PIN = 26  # Pin untuk sensor water level
+INLET_VALVE_PIN = 23
+DRAIN_VALVE_PIN = 24
+WATER_PUMP_PIN = 25
+WATER_LEVEL_PIN = 26
 
-# Setup GPIO untuk pin baru
-for pin in [INLET_VALVE_PIN, DRAIN_VALVE_PIN, WATER_PUMP_PIN]:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
-    
+# Disinfectant system pins
+DISINFECT_PUMP_PIN = 19
+DISINFECT_INLET_PIN = 16
+DISINFECT_DRAIN_PIN = 20
+DISINFECT_LEVEL_PIN = 21  # Tambahkan pin khusus untuk sensor level disinfectant
 
-if IS_RASPBERRY_PI:
-    # Pull-up/down configurations only available on Raspberry Pi
-    GPIO.setup(WATER_LEVEL_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-else:
-    # On PC, simplified setup without pull_up_down
-    GPIO.setup(WATER_LEVEL_PIN, GPIO.IN)
-
-GPIO.setmode(GPIO.BCM)
-for pin in list(PHASE_PINS.values()) + list(LED_PINS.values()) + [BUZZER_PIN]:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
-
-# Add these new pin constants at the top of your file with the other constants
-DISINFECT_PUMP_PIN = 19      # Pin untuk disinfectant pump (berbeda dari water pump biasa)
-DISINFECT_INLET_PIN = 16     # Pin untuk inlet valve disinfectant
-DISINFECT_DRAIN_PIN = 20     # Pin untuk drain valve disinfectant
-
-# Setup additional GPIO pins for disinfecting system
-for pin in [DISINFECT_PUMP_PIN, DISINFECT_INLET_PIN, DISINFECT_DRAIN_PIN]:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
+# Air-flush system pin
+AIR_PUMP_PIN = 4  # New pin for air pump
 
 OPERATORS_FILE = "operators.json"
 SCOPES_FILE = "scopes.json"
@@ -142,15 +122,95 @@ SCOPE_PREFIX = "SC-"
 
 LOG_DIRECTORY = "logs"
 LOG_DATABASE = "wash_history.json"
+BARCODE_DIRECTORY = "barcodes"
+OPERATOR_BARCODE_DIR = os.path.join(BARCODE_DIRECTORY, "operators")
+SCOPE_BARCODE_DIR = os.path.join(BARCODE_DIRECTORY, "scopes")
 
-# Folder konstanta
+# Konfigurasi sensor water level
+WATER_LEVEL_CONFIG = {
+    'timeout_seconds': 90,  # Timeout untuk pengisian air (1.5 menit)
+    'check_interval': 0.1,  # Interval pengecekan sensor (100ms)
+    'debounce_time': 0.5,   # Waktu debounce untuk sensor (500ms)
+    'min_stable_reads': 5   # Jumlah pembacaan stabil yang dibutuhkan
+}
 
-BARCODE_DIRECTORY = "barcodes"  # Tambahkan ini
-OPERATOR_BARCODE_DIR = os.path.join(BARCODE_DIRECTORY, "operators")  # Tambahkan ini
-SCOPE_BARCODE_DIR = os.path.join(BARCODE_DIRECTORY, "scopes")  # Tambahkan ini
+# Setup GPIO
+GPIO.setmode(GPIO.BCM)
+
+# Setup semua pin OUTPUT
+for pin in list(PHASE_PINS.values()) + list(LED_PINS.values()) + [BUZZER_PIN, AIR_PUMP_PIN]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+# Setup valve dan pump pins
+for pin in [INLET_VALVE_PIN, DRAIN_VALVE_PIN, WATER_PUMP_PIN, 
+            DISINFECT_PUMP_PIN, DISINFECT_INLET_PIN, DISINFECT_DRAIN_PIN]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+# Setup sensor pins dengan proper pull-up/down configuration
+if IS_RASPBERRY_PI:
+    GPIO.setup(WATER_LEVEL_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+    GPIO.setup(DISINFECT_LEVEL_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+else:
+    GPIO.setup(WATER_LEVEL_PIN, GPIO.IN)
+    GPIO.setup(DISINFECT_LEVEL_PIN, GPIO.IN)
+
+class WaterLevelSensor:
+    """Class untuk menangani pembacaan sensor water level dengan debouncing dan filtering"""
+    
+    def __init__(self, pin, name="Water Level"):
+        self.pin = pin
+        self.name = name
+        self.last_stable_state = False
+        self.last_read_time = 0
+        self.stable_count = 0
+        
+    def read_stable_level(self):
+        """Membaca level air dengan debouncing untuk menghindari false positive"""
+        current_time = time.time()
+        current_state = GPIO.input(self.pin)
+        
+        # Jika pembacaan sama dengan state terakhir
+        if current_state == self.last_stable_state:
+            self.stable_count += 1
+        else:
+            self.stable_count = 0
+            
+        # Update state hanya jika sudah stabil
+        if self.stable_count >= WATER_LEVEL_CONFIG['min_stable_reads']:
+            self.last_stable_state = current_state
+            
+        self.last_read_time = current_time
+        return self.last_stable_state
+    
+    def wait_for_level(self, target_level=True, timeout_seconds=90, update_callback=None):
+        """
+        Menunggu sampai level air mencapai target atau timeout
+        target_level: True untuk level penuh, False untuk level kosong
+        timeout_seconds: batas waktu tunggu
+        update_callback: callback untuk update display
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout_seconds:
+            current_level = self.read_stable_level()
+            
+            # Jika target level tercapai
+            if current_level == target_level:
+                return True
+                
+            # Update display jika ada callback
+            if update_callback:
+                remaining = int(timeout_seconds - (time.time() - start_time))
+                update_callback(remaining)
+                
+            time.sleep(WATER_LEVEL_CONFIG['check_interval'])
+            
+        # Timeout tercapai
+        return False
 
 
-# --- GUI Application ---
 class WasherApp:
     def __init__(self, root):
         self.root = root
@@ -165,31 +225,27 @@ class WasherApp:
         self.timer_display = tk.StringVar(value="--:--")
         self.history_log = []
         
-         # Tambahkan variabel untuk menyimpan ID operator dan scope
         self.operator_id = tk.StringVar(value="")
         self.scope_id = tk.StringVar(value="")
         
-        # Tambahkan variabel untuk database
         self.operators_db = self.load_database(OPERATORS_FILE)
         self.scopes_db = self.load_database(SCOPES_FILE)
         
-        # Variabel untuk capture barcode
         self.barcode_var = tk.StringVar()
         self.barcode_var.trace_add("write", self.process_barcode_input)
         
-        # Flag untuk kontrol process
         self.process_running = False
         self.stop_requested = False
 
-        # Pastikan direktori log ada
+        # Initialize sensor objects
+        self.water_sensor = WaterLevelSensor(WATER_LEVEL_PIN, "Main Water")
+        self.disinfect_sensor = WaterLevelSensor(DISINFECT_LEVEL_PIN, "Disinfectant")
+
         if not os.path.exists(LOG_DIRECTORY):
             os.makedirs(LOG_DIRECTORY)
 
         self.ensure_directories()
-        
-        # Load history database
         self.history_database = self.load_history_database()
-
         self.create_widgets()
 
     def ensure_directories(self):
@@ -266,7 +322,8 @@ class WasherApp:
 
 
     def start_process(self):
-        # Validasi input operator dan scope
+        """Method untuk memulai proses washing"""
+        # Validasi input
         if not self.operator_id.get():
             messagebox.showerror("Error", "Operator ID harus diisi!")
             return
@@ -275,9 +332,12 @@ class WasherApp:
             messagebox.showerror("Error", "Scope ID harus diisi!")
             return
             
-        # Validasi setidaknya 1 fase dipilih
         if not any(self.phase_vars[phase].get() for phase in PHASES):
             messagebox.showerror("Error", "Pilih minimal satu fase untuk dijalankan!")
+            return
+        
+        # Test sensor sebelum memulai
+        if not self.test_sensors():
             return
             
         self.process_running = True
@@ -286,21 +346,33 @@ class WasherApp:
         self.stop_button.config(state=tk.NORMAL)
         threading.Thread(target=self.run_all_phases, daemon=True).start()
 
-    def stop_process(self):
-        if not self.process_running:
-            return
+    def test_sensors(self):
+        """Test sensor sebelum memulai proses"""
+        try:
+            # Test water level sensor
+            water_level = self.water_sensor.read_stable_level()
+            disinfect_level = self.disinfect_sensor.read_stable_level()
             
-        # Konfirmasi apakah pengguna yakin ingin menghentikan proses
-        confirm = messagebox.askyesno("Konfirmasi", "Yakin menghentikan proses?")
-        if confirm:
-            self.stop_requested = True
-            self.current_phase.set("Menghentikan Proses...")
-
+            # Tampilkan status sensor
+            sensor_status = f"Water Level Sensor: {'HIGH' if water_level else 'LOW'}\n"
+            sensor_status += f"Disinfectant Level Sensor: {'HIGH' if disinfect_level else 'LOW'}\n\n"
+            sensor_status += "Pastikan tangki kosong sebelum memulai proses."
+            
+            result = messagebox.askyesno("Sensor Status", 
+                f"{sensor_status}\n\nLanjutkan proses?")
+            
+            return result
+            
+        except Exception as e:
+            messagebox.showerror("Sensor Error", 
+                f"Error testing sensors: {str(e)}\n\nPeriksa koneksi sensor.")
+            return False
+        
     def run_all_phases(self):
+        """Method utama untuk menjalankan semua fase"""
         success = True
         GPIO.output(LED_PINS['status'], GPIO.HIGH)
         
-        # Mulai mencatat waktu proses dimulai
         start_time = datetime.now()
         log_entry = {
             "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -310,57 +382,85 @@ class WasherApp:
             "status": "SUCCESS"
         }
         
-        for phase in PHASES:
-            if self.stop_requested:
-                log_entry["status"] = "STOPPED_BY_USER"
-                break
-                    
-            if self.phase_vars[phase].get():
-                duration = self.phase_times[phase].get()
-                
-                # Jalankan fase yang sesuai
-                if phase == 'Detergent Wash':
-                    phase_result = self.run_detergent_wash_phase(duration)
-                elif phase == 'Rinsing':
-                    phase_result = self.run_rinsing_phase(duration)
-                elif phase == 'Disinfecting':
-                    phase_result = self.run_disinfecting_phase(duration)
-                elif phase == 'Final Rinse':
-                    phase_result = self.run_final_rinse_phase(duration)
-                
-                phase_log = {
-                    "name": phase,
-                    "duration": duration,
-                    "status": "SUCCESS" if phase_result else "ERROR"
-                }
-                log_entry["phases"].append(phase_log)
-                
-                if not phase_result:
-                    success = False
-                    log_entry["status"] = "ERROR"
+        try:
+            for phase in PHASES:
+                if self.stop_requested:
+                    log_entry["status"] = "STOPPED_BY_USER"
                     break
-        
-        # Catat waktu proses selesai
-        end_time = datetime.now()
-        log_entry["timestamp_end"] = end_time.strftime("%Y-%m-%d %H:%M:%S")
-        log_entry["total_duration"] = str(end_time - start_time)
-        
-        self.history_log.append(log_entry)
-        
-        # Save log otomatis ke file
-        self.save_log_entry(log_entry)
-        
-        # Update status akhir
-        if self.stop_requested:
-            self.current_phase.set("Proses dihentikan oleh pengguna")
-        else:
-            self.current_phase.set("Completed" if success else "ERROR Detected!")
+                        
+                if self.phase_vars[phase].get():
+                    duration = self.phase_times[phase].get()
+                    
+                    # Jalankan fase yang sesuai
+                    if phase == 'Detergent Wash':
+                        phase_result = self.run_detergent_wash_phase(duration)
+                    elif phase == 'Rinsing':
+                        phase_result = self.run_rinsing_phase(duration)
+                    elif phase == 'Disinfecting':
+                        phase_result = self.run_disinfecting_phase(duration)
+                    elif phase == 'Final Rinse':
+                        phase_result = self.run_final_rinse_phase(duration)
+                    elif phase == 'Air-flush':  # TAMBAHAN BARU
+                        phase_result = self.run_air_flush_phase(duration)
+                    
+                    phase_log = {
+                        "name": phase,
+                        "duration": duration,
+                        "status": "SUCCESS" if phase_result else "ERROR"
+                    }
+                    log_entry["phases"].append(phase_log)
+                    
+                    if not phase_result:
+                        success = False
+                        log_entry["status"] = "ERROR"
+                        break
             
-        self.timer_display.set("--:--")
-        GPIO.output(LED_PINS['status'], GPIO.LOW)
+        except Exception as e:
+            success = False
+            log_entry["status"] = "SYSTEM_ERROR"
+            log_entry["error"] = str(e)
+            messagebox.showerror("System Error", f"Terjadi error: {str(e)}")
         
-        if not success and not self.stop_requested:
-            GPIO.output(LED_PINS['error'], GPIO.HIGH)
+        finally:
+            # Cleanup
+            self.shutdown_all_valves()
+            
+            # Update log
+            end_time = datetime.now()
+            log_entry["timestamp_end"] = end_time.strftime("%Y-%m-%d %H:%M:%S")
+            log_entry["total_duration"] = str(end_time - start_time)
+            
+            self.history_log.append(log_entry)
+            self.save_log_entry(log_entry)
+            
+            # Update status akhir
+            if self.stop_requested:
+                self.current_phase.set("Proses dihentikan oleh pengguna")
+            else:
+                self.current_phase.set("Completed" if success else "ERROR Detected!")
+                
+            self.timer_display.set("--:--")
+            GPIO.output(LED_PINS['status'], GPIO.LOW)
+            
+            if not success and not self.stop_requested:
+                GPIO.output(LED_PINS['error'], GPIO.HIGH)
+                self.sound_error_buzzer()
+            
+            # Print report
+            if success and not self.stop_requested:
+                # TAMBAHAN: Sound completion buzzer
+                self.sound_completion_buzzer()
+                self.root.after(500, lambda: self.print_wash_report(log_entry))
+            
+            # Reset button state
+            self.process_running = False
+            self.stop_requested = False
+            self.start_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+
+    def sound_error_buzzer(self):
+        """Sound buzzer untuk error"""
+        try:
             GPIO.output(BUZZER_PIN, GPIO.HIGH)
             time.sleep(1)
             GPIO.output(BUZZER_PIN, GPIO.LOW)
@@ -368,350 +468,341 @@ class WasherApp:
             GPIO.output(BUZZER_PIN, GPIO.HIGH)
             time.sleep(1)
             GPIO.output(BUZZER_PIN, GPIO.LOW)
-        
-        # Setelah proses selesai, tampilkan opsi untuk print report
-        self.root.after(500, lambda: self.print_wash_report(log_entry))
-        
-        # Reset button state
-        self.process_running = False
-        self.stop_requested = False
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
+        except:
+            pass
+
+    def sound_completion_buzzer(self):
+        """Sound buzzer untuk menandakan completion"""
+        try:
+            # Pola buzzer completion: 3 beep pendek
+            for i in range(3):
+                GPIO.output(BUZZER_PIN, GPIO.HIGH)
+                time.sleep(0.3)
+                GPIO.output(BUZZER_PIN, GPIO.LOW)
+                time.sleep(0.2)
+        except:
+            pass
+
+    def stop_process(self):
+        """Method untuk menghentikan proses"""
+        if not self.process_running:
+            return
+            
+        confirm = messagebox.askyesno("Konfirmasi", "Yakin menghentikan proses?")
+        if confirm:
+            self.stop_requested = True
+            self.current_phase.set("Menghentikan Proses...")
+
+    
 
     def run_detergent_wash_phase(self, duration_minutes):
         """
-        Menjalankan fase Detergent Wash dengan proses yang dimodifikasi:
-        1. Membuka inlet valve, menutup drain valve, menyalakan water pump
-        2. Menunggu sampai water level tercapai atau batas waktu 1 menit
-        3. Menutup inlet valve, mematikan water pump
-        4. Menampilkan pesan untuk menambahkan deterjen
-        5. Menjalankan timer selama durasi yang ditentukan
-        6. Membuka drain valve untuk mengosongkan bak
+        Menjalankan fase Detergent Wash dengan sensor water level real
         """
         phase = 'Detergent Wash'
         pin = PHASE_PINS[phase]
         self.current_phase.set(f"Running: {phase} - Filling Water")
         
-        # Indikator fase aktif
         GPIO.output(pin, GPIO.HIGH)
         
-        # Step 1: Membuka inlet valve, menutup drain valve, menyalakan water pump
-        GPIO.output(INLET_VALVE_PIN, GPIO.HIGH)  # Buka inlet valve
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)   # Tutup drain valve
-        GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)   # Nyalakan water pump
-        
-        # Step 2: Menunggu sampai water level tercapai atau batas waktu 1 menit (60 detik)
-        fill_time = 60  # 60 detik untuk pengisian
-        fill_start = time.time()
-        
-        self.timer_display.set("FILL")
-        self.root.update()
-        
-        # Loop selama air belum penuh dan waktu belum habis
-        while not GPIO.input(WATER_LEVEL_PIN) and time.time() - fill_start < fill_time:
-            # Cek apakah proses dihentikan
+        try:
+            # Step 1: Buka inlet valve, tutup drain valve, nyalakan water pump
+            GPIO.output(INLET_VALVE_PIN, GPIO.HIGH)
+            GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)
+            GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)
+            
+            # Step 2: Tunggu sampai water level tercapai dengan sensor real
+            def update_fill_display(remaining_time):
+                if self.stop_requested:
+                    return
+                self.timer_display.set(f"FILL {remaining_time:02d}s")
+                self.root.update()
+            
+            self.current_phase.set(f"Running: {phase} - Filling Water")
+            water_filled = self.water_sensor.wait_for_level(
+                target_level=True, 
+                timeout_seconds=WATER_LEVEL_CONFIG['timeout_seconds'],
+                update_callback=update_fill_display
+            )
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
                 return False
                 
-            # Update timer display dengan waktu pengisian tersisa
-            remaining = int(fill_time - (time.time() - fill_start))
-            self.timer_display.set(f"F {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Step 3: Menutup inlet valve, mematikan water pump setelah level air tercapai atau waktu habis
-        GPIO.output(INLET_VALVE_PIN, GPIO.LOW)  # Tutup inlet valve
-        GPIO.output(WATER_PUMP_PIN, GPIO.LOW)   # Matikan water pump
-        
-        # Step 4: Tampilkan pesan ke operator untuk menambahkan deterjen
-        self.current_phase.set(f"Running: {phase} - Water Full")
-        messagebox.showinfo("Detergent Wash", "Water level reached. Please add detergent manually and click OK to continue.")
-        
-        # Step 5: Jalankan timer selama durasi yang ditentukan
-        self.current_phase.set(f"Running: {phase} - Washing")
-        total_seconds = duration_minutes * 60
-        
-        for remaining in range(total_seconds, 0, -1):
+            if not water_filled:
+                # Timeout - tampilkan warning tapi lanjutkan proses
+                messagebox.showwarning("Water Level Warning", 
+                    "Water level sensor tidak mendeteksi level penuh dalam batas waktu. "
+                    "Periksa sensor atau suplai air. Proses akan dilanjutkan.")
+            
+            # Step 3: Tutup inlet valve, matikan water pump
+            GPIO.output(INLET_VALVE_PIN, GPIO.LOW)
+            GPIO.output(WATER_PUMP_PIN, GPIO.LOW)
+            
+            # Step 4: Tampilkan pesan untuk menambahkan deterjen
+            self.current_phase.set(f"Running: {phase} - Ready for Detergent")
+            messagebox.showinfo("Detergent Wash", 
+                "Water filling complete. Please add detergent manually and click OK to continue.")
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
                 return False
-                    
-            mins, secs = divmod(remaining, 60)
-            self.timer_display.set(f"{mins:02d}:{secs:02d}")
-            self.root.update()
-            time.sleep(1)
-        
-        # Step 6: Membuka drain valve untuk mengosongkan bak
-        self.current_phase.set(f"Running: {phase} - Draining")
-        self.timer_display.set("DRAIN")
-        self.root.update()
-        
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.HIGH)  # Buka drain valve
-        
-        # Tunggu selama waktu pengosongan (1 menit)
-        drain_time = 60  # 60 detik untuk pengosongan
-        drain_start = time.time()
-        
-        while time.time() - drain_start < drain_time:
-            if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
+            
+            # Step 5: Jalankan timer washing
+            self.current_phase.set(f"Running: {phase} - Washing")
+            if not self.run_timer_phase(duration_minutes):
                 return False
-                    
-            # Update timer display dengan waktu pengosongan tersisa
-            remaining = int(drain_time - (time.time() - drain_start))
-            self.timer_display.set(f"D {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Fase Detergent Wash selesai
-        self.shutdown_all_valves()
-        GPIO.output(pin, GPIO.LOW)
-        self.timer_display.set("00:00")
-        return True
+            
+            # Step 6: Drain phase
+            if not self.run_drain_phase(phase):
+                return False
+                
+            return True
+            
+        finally:
+            self.shutdown_all_valves()
+            GPIO.output(pin, GPIO.LOW)
     
     def run_rinsing_phase(self, duration_minutes):
-        """
-        Menjalankan fase Rinsing dengan proses yang dimodifikasi:
-        1. Membuka inlet valve, menutup drain valve, menyalakan water pump
-        2. Menunggu sampai water level tercapai atau batas waktu 1 menit
-        3. Menutup inlet valve, mematikan water pump
-        4. Menjalankan timer selama durasi yang ditentukan
-        5. Membuka drain valve untuk mengosongkan bak
-        """
+        """Menjalankan fase Rinsing dengan sensor water level real"""
         phase = 'Rinsing'
         pin = PHASE_PINS[phase]
-        self.current_phase.set(f"Running: {phase} - Filling Water")
         
-        # Indikator fase aktif
         GPIO.output(pin, GPIO.HIGH)
         
-        # Step 1: Membuka inlet valve, menutup drain valve, menyalakan water pump
-        GPIO.output(INLET_VALVE_PIN, GPIO.HIGH)  # Buka inlet valve
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)   # Tutup drain valve
-        GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)   # Nyalakan water pump
-        
-        # Step 2: Menunggu sampai water level tercapai atau batas waktu 1 menit (60 detik)
-        fill_time = 60  # 60 detik untuk pengisian
-        fill_start = time.time()
-        
-        self.timer_display.set("FILL")
-        self.root.update()
-        
-        # Loop selama air belum penuh dan waktu belum habis
-        while not GPIO.input(WATER_LEVEL_PIN) and time.time() - fill_start < fill_time:
-            # Cek apakah proses dihentikan
+        try:
+            # Fill water dengan sensor real
+            if not self.fill_water_phase(phase):
+                return False
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
+                return False
+            
+            # Rinsing timer
+            self.current_phase.set(f"Running: {phase} - Rinsing")
+            if not self.run_timer_phase(duration_minutes):
+                return False
+            
+            # Drain phase
+            if not self.run_drain_phase(phase):
                 return False
                 
-            # Update timer display dengan waktu pengisian tersisa
-            remaining = int(fill_time - (time.time() - fill_start))
-            self.timer_display.set(f"F {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Step 3: Menutup inlet valve, mematikan water pump setelah level air tercapai atau waktu habis
-        GPIO.output(INLET_VALVE_PIN, GPIO.LOW)  # Tutup inlet valve
-        GPIO.output(WATER_PUMP_PIN, GPIO.LOW)   # Matikan water pump
-        
-        # Step 4: Jalankan timer selama durasi yang ditentukan
-        self.current_phase.set(f"Running: {phase} - Rinsing")
-        total_seconds = duration_minutes * 60
-        
-        for remaining in range(total_seconds, 0, -1):
-            if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
-                return False
-                
-            mins, secs = divmod(remaining, 60)
-            self.timer_display.set(f"{mins:02d}:{secs:02d}")
-            self.root.update()
-            time.sleep(1)
-        
-        # Step 5: Membuka drain valve untuk mengosongkan bak
-        self.current_phase.set(f"Running: {phase} - Draining")
-        self.timer_display.set("DRAIN")
-        self.root.update()
-        
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.HIGH)  # Buka drain valve
-        
-        # Tunggu selama waktu pengosongan (1 menit)
-        drain_time = 60  # 60 detik untuk pengosongan
-        drain_start = time.time()
-        
-        while time.time() - drain_start < drain_time:
-            if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
-                return False
-                
-            # Update timer display dengan waktu pengosongan tersisa
-            remaining = int(drain_time - (time.time() - drain_start))
-            self.timer_display.set(f"D {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Fase Rinsing selesai
-        self.shutdown_all_valves()
-        GPIO.output(pin, GPIO.LOW)
-        self.timer_display.set("00:00")
-        return True
+            return True
+            
+        finally:
+            self.shutdown_all_valves()
+            GPIO.output(pin, GPIO.LOW)
+
     
     def run_disinfecting_phase(self, duration_minutes):
         """
-        Menjalankan fase Disinfecting dengan proses khusus:
-        1. Membuka inlet valve disinfectant, menutup semua drain valve, menyalakan disinfectant pump
-        2. Menunggu sampai water level tercapai atau batas waktu 1 menit
-        3. Menutup inlet valve disinfectant, mematikan disinfectant pump
-        4. Menjalankan timer selama durasi yang ditentukan
-        5. Membuka drain valve disinfectant untuk mengembalikan cairan ke tank disinfectant
-        (drain valve utama tetap tertutup)
+        Menjalankan fase Disinfecting dengan sensor level disinfectant real
         """
         phase = 'Disinfecting'
         pin = PHASE_PINS[phase]
-        self.current_phase.set(f"Running: {phase} - Filling Disinfectant")
         
-        # Indikator fase aktif
         GPIO.output(pin, GPIO.HIGH)
         
-        # Step 1: Membuka inlet valve disinfectant, menutup semua drain valve, menyalakan disinfectant pump
-        GPIO.output(DISINFECT_INLET_PIN, GPIO.HIGH)  # Buka inlet valve disinfectant
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)       # Tutup drain valve utama
-        GPIO.output(DISINFECT_DRAIN_PIN, GPIO.LOW)   # Tutup drain valve disinfectant
-        GPIO.output(DISINFECT_PUMP_PIN, GPIO.HIGH)   # Nyalakan disinfectant pump
-        
-        # Step 2: Menunggu sampai water level tercapai atau batas waktu 1 menit (60 detik)
-        fill_time = 60  # 60 detik untuk pengisian
-        fill_start = time.time()
-        
-        self.timer_display.set("FILL")
-        self.root.update()
-        
-        # Loop selama level disinfectant belum penuh dan waktu belum habis
-        while not GPIO.input(WATER_LEVEL_PIN) and time.time() - fill_start < fill_time:
-            # Cek apakah proses dihentikan
+        try:
+            # Step 1: Fill disinfectant dengan sensor real
+            GPIO.output(DISINFECT_INLET_PIN, GPIO.HIGH)
+            GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)
+            GPIO.output(DISINFECT_DRAIN_PIN, GPIO.LOW)
+            GPIO.output(DISINFECT_PUMP_PIN, GPIO.HIGH)
+            
+            def update_disinfect_fill_display(remaining_time):
+                if self.stop_requested:
+                    return
+                self.timer_display.set(f"D-FILL {remaining_time:02d}s")
+                self.root.update()
+            
+            self.current_phase.set(f"Running: {phase} - Filling Disinfectant")
+            disinfect_filled = self.disinfect_sensor.wait_for_level(
+                target_level=True,
+                timeout_seconds=WATER_LEVEL_CONFIG['timeout_seconds'],
+                update_callback=update_disinfect_fill_display
+            )
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
                 return False
                 
-            # Update timer display dengan waktu pengisian tersisa
-            remaining = int(fill_time - (time.time() - fill_start))
-            self.timer_display.set(f"F {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Step 3: Menutup inlet valve disinfectant, mematikan disinfectant pump setelah level tercapai
-        GPIO.output(DISINFECT_INLET_PIN, GPIO.LOW)   # Tutup inlet valve disinfectant
-        GPIO.output(DISINFECT_PUMP_PIN, GPIO.LOW)    # Matikan disinfectant pump
-        
-        # Step 4: Jalankan timer selama durasi yang ditentukan
-        self.current_phase.set(f"Running: {phase} - Disinfecting")
-        total_seconds = duration_minutes * 60
-        
-        for remaining in range(total_seconds, 0, -1):
+            if not disinfect_filled:
+                messagebox.showwarning("Disinfectant Level Warning",
+                    "Sensor level disinfectant tidak mendeteksi level penuh. "
+                    "Periksa sensor atau suplai disinfectant. Proses akan dilanjutkan.")
+            
+            # Step 2: Stop filling
+            GPIO.output(DISINFECT_INLET_PIN, GPIO.LOW)
+            GPIO.output(DISINFECT_PUMP_PIN, GPIO.LOW)
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
+                return False
+            
+            # Step 3: Disinfecting timer
+            self.current_phase.set(f"Running: {phase} - Disinfecting")
+            if not self.run_timer_phase(duration_minutes):
+                return False
+            
+            # Step 4: Return disinfectant to tank
+            if not self.return_disinfectant_phase():
                 return False
                 
-            mins, secs = divmod(remaining, 60)
-            self.timer_display.set(f"{mins:02d}:{secs:02d}")
-            self.root.update()
-            time.sleep(1)
-        
-        # Step 5: Membuka drain valve disinfectant untuk mengembalikan cairan ke tank disinfectant
-        self.current_phase.set(f"Running: {phase} - Returning Disinfectant")
-        self.timer_display.set("DRAIN")
-        self.root.update()
-        
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)       # Pastikan drain valve utama tetap tertutup
-        GPIO.output(DISINFECT_DRAIN_PIN, GPIO.HIGH)  # Buka drain valve disinfectant
-        GPIO.output(DISINFECT_PUMP_PIN, GPIO.HIGH)   # Nyalakan kembali pump untuk membantu proses drain
-        
-        # Tunggu selama waktu pengosongan (1 menit)
-        drain_time = 60  # 60 detik untuk pengembalian cairan disinfectant
-        drain_start = time.time()
-        
-        while time.time() - drain_start < drain_time:
-            if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
-                return False
-                
-            # Update timer display dengan waktu pengosongan tersisa
-            remaining = int(drain_time - (time.time() - drain_start))
-            self.timer_display.set(f"D {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Fase Disinfecting selesai
-        self.shutdown_all_valves()
-        GPIO.output(pin, GPIO.LOW)
-        self.timer_display.set("00:00")
-        return True
+            return True
+            
+        finally:
+            self.shutdown_all_valves()
+            GPIO.output(pin, GPIO.LOW)
 
     
 
     def run_final_rinse_phase(self, duration_minutes):
-        """
-        Menjalankan fase Final Rinse dengan proses yang dimodifikasi:
-        1. Membuka inlet valve, menutup drain valve, menyalakan water pump
-        2. Menunggu sampai water level tercapai atau batas waktu 1 menit
-        3. Menutup inlet valve, mematikan water pump
-        4. Menjalankan timer selama durasi yang ditentukan
-        5. Membuka drain valve untuk mengosongkan bak
-        """
+        """Menjalankan fase Final Rinse dengan sensor water level real"""
         phase = 'Final Rinse'
         pin = PHASE_PINS[phase]
-        self.current_phase.set(f"Running: {phase} - Filling Water")
         
-        # Indikator fase aktif
         GPIO.output(pin, GPIO.HIGH)
         
-        # Step 1: Membuka inlet valve, menutup drain valve, menyalakan water pump
-        GPIO.output(INLET_VALVE_PIN, GPIO.HIGH)  # Buka inlet valve
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)   # Tutup drain valve
-        GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)   # Nyalakan water pump
-        
-        # Step 2: Menunggu sampai water level tercapai atau batas waktu 1 menit (60 detik)
-        fill_time = 60  # 60 detik untuk pengisian
-        fill_start = time.time()
-        
-        self.timer_display.set("FILL")
-        self.root.update()
-        
-        # Loop selama air belum penuh dan waktu belum habis
-        while not GPIO.input(WATER_LEVEL_PIN) and time.time() - fill_start < fill_time:
-            # Cek apakah proses dihentikan
+        try:
+            # Fill water dengan sensor real
+            if not self.fill_water_phase(phase):
+                return False
+            
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
+                return False
+            
+            # Final rinse dengan sirkulasi
+            self.current_phase.set(f"Running: {phase} - Final Rinsing")
+            GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)  # Keep pump running for circulation
+            
+            if not self.run_timer_phase(duration_minutes):
+                return False
+            
+            GPIO.output(WATER_PUMP_PIN, GPIO.LOW)  # Stop pump before draining
+            
+            # Drain phase
+            if not self.run_drain_phase(phase):
                 return False
                 
-            # Update timer display dengan waktu pengisian tersisa
-            remaining = int(fill_time - (time.time() - fill_start))
-            self.timer_display.set(f"F {remaining:02d}s")
+            return True
+            
+        finally:
+            self.shutdown_all_valves()
+            GPIO.output(pin, GPIO.LOW)
+
+    def fill_water_phase(self, phase_name):
+        """Helper method untuk mengisi air dengan sensor real"""
+        self.current_phase.set(f"Running: {phase_name} - Filling Water")
+        
+        GPIO.output(INLET_VALVE_PIN, GPIO.HIGH)
+        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)
+        GPIO.output(WATER_PUMP_PIN, GPIO.HIGH)
+        
+        def update_fill_display(remaining_time):
+            if self.stop_requested:
+                return
+            self.timer_display.set(f"FILL {remaining_time:02d}s")
+            self.root.update()
+        
+        water_filled = self.water_sensor.wait_for_level(
+            target_level=True,
+            timeout_seconds=WATER_LEVEL_CONFIG['timeout_seconds'],
+            update_callback=update_fill_display
+        )
+        
+        GPIO.output(INLET_VALVE_PIN, GPIO.LOW)
+        GPIO.output(WATER_PUMP_PIN, GPIO.LOW)
+        
+        if self.stop_requested:
+            return False
+            
+        if not water_filled:
+            messagebox.showwarning("Water Level Warning",
+                f"Water level tidak tercapai untuk fase {phase_name}. "
+                "Periksa sensor atau suplai air. Proses akan dilanjutkan.")
+        
+        return True
+    
+    def run_drain_phase(self, phase_name):
+        """Helper method untuk drain dengan monitoring"""
+        self.current_phase.set(f"Running: {phase_name} - Draining")
+        
+        GPIO.output(DRAIN_VALVE_PIN, GPIO.HIGH)
+        
+        # Monitor drain process
+        drain_time = 60
+        start_time = time.time()
+        
+        while time.time() - start_time < drain_time:
+            if self.stop_requested:
+                return False
+                
+            remaining = int(drain_time - (time.time() - start_time))
+            self.timer_display.set(f"DRAIN {remaining:02d}s")
             self.root.update()
             time.sleep(0.5)
         
-        # Step 3: Menutup inlet valve, water pump tetap menyala selama proses final rinse
-        GPIO.output(INLET_VALVE_PIN, GPIO.LOW)  # Tutup inlet valve
+        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)
+        return True
+    
+    def return_disinfectant_phase(self):
+        """Helper method untuk mengembalikan disinfectant ke tank"""
+        self.current_phase.set("Running: Disinfecting - Returning Disinfectant")
         
-        # Step 4: Jalankan timer selama durasi yang ditentukan (water pump tetap aktif untuk sirkulasi)
-        self.current_phase.set(f"Running: {phase} - Final Rinsing")
+        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)  # Keep main drain closed
+        GPIO.output(DISINFECT_DRAIN_PIN, GPIO.HIGH)  # Open disinfect drain
+        GPIO.output(DISINFECT_PUMP_PIN, GPIO.HIGH)  # Pump to help return
+        
+        # Monitor return process
+        return_time = 60
+        start_time = time.time()
+        
+        while time.time() - start_time < return_time:
+            if self.stop_requested:
+                return False
+                
+            remaining = int(return_time - (time.time() - start_time))
+            self.timer_display.set(f"D-RETURN {remaining:02d}s")
+            self.root.update()
+            time.sleep(0.5)
+        
+        GPIO.output(DISINFECT_DRAIN_PIN, GPIO.LOW)
+        GPIO.output(DISINFECT_PUMP_PIN, GPIO.LOW)
+        return True
+    
+    def run_air_flush_phase(self, duration_minutes):
+        """
+        Menjalankan fase Air-flush dengan pompa udara
+        """
+        phase = 'Air-flush'
+        pin = PHASE_PINS[phase]
+        
+        GPIO.output(pin, GPIO.HIGH)
+        
+        try:
+            # Pastikan semua valve tertutup sebelum air flush
+            self.shutdown_all_valves()
+            
+            # Step 1: Nyalakan pompa udara
+            self.current_phase.set(f"Running: {phase} - Air Flushing")
+            GPIO.output(AIR_PUMP_PIN, GPIO.HIGH)
+            
+            # Step 2: Jalankan timer
+            if not self.run_timer_phase(duration_minutes):
+                return False
+            
+            # Step 3: Matikan pompa udara
+            GPIO.output(AIR_PUMP_PIN, GPIO.LOW)
+            
+            return True
+            
+        finally:
+            GPIO.output(AIR_PUMP_PIN, GPIO.LOW)
+            GPIO.output(pin, GPIO.LOW)
+
+    def run_timer_phase(self, duration_minutes):
+        """Helper method untuk menjalankan timer fase"""
         total_seconds = duration_minutes * 60
         
         for remaining in range(total_seconds, 0, -1):
             if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
                 return False
                 
             mins, secs = divmod(remaining, 60)
@@ -719,44 +810,18 @@ class WasherApp:
             self.root.update()
             time.sleep(1)
         
-        # Step 5: Membuka drain valve untuk mengosongkan bak
-        self.current_phase.set(f"Running: {phase} - Draining")
-        self.timer_display.set("DRAIN")
-        self.root.update()
-        
-        GPIO.output(WATER_PUMP_PIN, GPIO.LOW)     # Matikan water pump
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.HIGH)   # Buka drain valve
-        
-        # Tunggu selama waktu pengosongan (1 menit)
-        drain_time = 60  # 60 detik untuk pengosongan
-        drain_start = time.time()
-        
-        while time.time() - drain_start < drain_time:
-            if self.stop_requested:
-                self.shutdown_all_valves()
-                GPIO.output(pin, GPIO.LOW)
-                return False
-                
-            # Update timer display dengan waktu pengosongan tersisa
-            remaining = int(drain_time - (time.time() - drain_start))
-            self.timer_display.set(f"D {remaining:02d}s")
-            self.root.update()
-            time.sleep(0.5)
-        
-        # Final Rinse selesai
-        self.shutdown_all_valves()
-        GPIO.output(pin, GPIO.LOW)
-        self.timer_display.set("00:00")
         return True
 
     def shutdown_all_valves(self):
         """Mematikan semua valve dan pump untuk keamanan"""
-        GPIO.output(INLET_VALVE_PIN, GPIO.LOW)
-        GPIO.output(DRAIN_VALVE_PIN, GPIO.LOW)
-        GPIO.output(WATER_PUMP_PIN, GPIO.LOW)
-        GPIO.output(DISINFECT_INLET_PIN, GPIO.LOW)
-        GPIO.output(DISINFECT_DRAIN_PIN, GPIO.LOW)
-        GPIO.output(DISINFECT_PUMP_PIN, GPIO.LOW)
+        pins_to_shutdown = [
+            INLET_VALVE_PIN, DRAIN_VALVE_PIN, WATER_PUMP_PIN,
+            DISINFECT_INLET_PIN, DISINFECT_DRAIN_PIN, DISINFECT_PUMP_PIN,
+            AIR_PUMP_PIN  # Tambahan air pump
+        ]
+        
+        for pin in pins_to_shutdown:
+            GPIO.output(pin, GPIO.LOW)
 
     
     def simulate_flow_check(self):
@@ -919,7 +984,10 @@ class WasherApp:
             # Ini adalah barcode operator
             if barcode_data in self.operators_db:
                 operator_info = self.operators_db[barcode_data]
-                self.operator_id.set(barcode_data)
+                # Tampilkan nama operator di kolom, bukan ID
+                self.operator_id.set(operator_info['name'])  # Menggunakan nama, bukan ID
+                # Simpan ID asli untuk keperluan internal (jika diperlukan)
+                self.current_operator_id = barcode_data  # Menyimpan ID asli
                 messagebox.showinfo("Operator Detected", f"Operator: {operator_info['name']}")
             else:
                 messagebox.showerror("Error", f"Unknown operator ID: {barcode_data}")
@@ -928,7 +996,10 @@ class WasherApp:
             # Ini adalah barcode scope
             if barcode_data in self.scopes_db:
                 scope_info = self.scopes_db[barcode_data]
-                self.scope_id.set(barcode_data)
+                # Tampilkan model scope di kolom, bukan ID
+                self.scope_id.set(scope_info['model'])  # Menggunakan model, bukan ID
+                # Simpan ID asli untuk keperluan internal (jika diperlukan)
+                self.current_scope_id = barcode_data  # Menyimpan ID asli
                 messagebox.showinfo("Scope Detected", 
                                 f"Scope: {scope_info['model']}\nSerial: {scope_info['serial']}")
             else:
@@ -1116,17 +1187,17 @@ class WasherApp:
         
         columns = ('date', 'scope_id', 'operator_id', 'status', 'duration')
         tree = ttk.Treeview(results_frame, columns=columns, show='headings')
-        
-        # Configure columns
+
+        # Configure columns dengan lebar yang disesuaikan
         tree.heading('date', text='Date/Time')
-        tree.heading('scope_id', text='Scope ID')
+        tree.heading('scope_id', text='Scope')
         tree.heading('operator_id', text='Operator')
         tree.heading('status', text='Status')
         tree.heading('duration', text='Duration')
-        
+
         tree.column('date', width=150)
-        tree.column('scope_id', width=100)
-        tree.column('operator_id', width=100)
+        tree.column('scope_id', width=180)  # Diperlebar untuk menampung ID + Model
+        tree.column('operator_id', width=180)  # Diperlebar untuk menampung ID + Name
         tree.column('status', width=100)
         tree.column('duration', width=100)
         
@@ -1171,12 +1242,24 @@ class WasherApp:
                 # Check scope filter
                 if scope_filter and entry.get('scope_id', '') != scope_filter:
                     continue
+                
+                # Format operator display (ID + Name)
+                operator_display = entry.get('operator_id', 'N/A')
+                if entry.get('operator_id') in self.operators_db:
+                    operator_name = self.operators_db[entry['operator_id']]['name']
+                    operator_display = f"{entry['operator_id']} - {operator_name}"
+                
+                # Format scope display (ID + Model)
+                scope_display = entry.get('scope_id', 'N/A')
+                if entry.get('scope_id') in self.scopes_db:
+                    scope_model = self.scopes_db[entry['scope_id']]['model']
+                    scope_display = f"{entry['scope_id']} - {scope_model}"
                     
                 # Add to tree
                 tree.insert('', 'end', values=(
                     entry['timestamp_start'],
-                    entry.get('scope_id', 'N/A'),
-                    entry.get('operator_id', 'N/A'),
+                    scope_display,  # Ubah dari scope_id ke scope_display
+                    operator_display,  # Ubah dari operator_id ke operator_display
                     entry.get('status', 'N/A'),
                     entry.get('total_duration', 'N/A')
                 ), tags=(entry.get('status', '')))
@@ -1536,9 +1619,21 @@ class WasherApp:
             preview.title("Print Preview")
             preview.geometry("500x600")
             
+            # Frame untuk tombol di bagian bawah (dibuat dulu agar tidak tertutup)
+            btn_frame = tk.Frame(preview)
+            btn_frame.pack(side=tk.BOTTOM, pady=10)
+            
+            # Status label untuk menampilkan hasil printing
+            status_label = tk.Label(preview, text="", fg="black")
+            status_label.pack(side=tk.BOTTOM, pady=5)
+            
+            # Frame untuk text area dan scrollbar
+            text_frame = tk.Frame(preview)
+            text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
             # Area teks untuk menampilkan isi file
-            text_area = tk.Text(preview, wrap=tk.WORD, bg="white", font=("Courier", 10))
-            scrollbar = tk.Scrollbar(preview, command=text_area.yview)
+            text_area = tk.Text(text_frame, wrap=tk.WORD, bg="white", font=("Courier", 10))
+            scrollbar = tk.Scrollbar(text_frame, command=text_area.yview)
             text_area.configure(yscrollcommand=scrollbar.set)
             
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1552,14 +1647,6 @@ class WasherApp:
             text_area.insert(tk.END, content)
             text_area.config(state=tk.DISABLED)  # Jadikan read-only
             
-            # Frame untuk tombol
-            btn_frame = tk.Frame(preview)
-            btn_frame.pack(pady=10)
-            
-            # Status label untuk menampilkan hasil printing
-            status_label = tk.Label(preview, text="", fg="black")
-            status_label.pack(pady=5)
-            
             # Fungsi untuk mengirim ke printer
             def send_to_printer():
                 success, message = self.print_file(filepath)
@@ -1570,8 +1657,8 @@ class WasherApp:
                     status_label.config(text=message, fg="red")
             
             ttk.Button(btn_frame, text="Print", command=send_to_printer).pack(side=tk.LEFT, padx=10)
-            ttk.Button(btn_frame, text="Close", command=preview.destroy).pack(side=tk.LEFT, padx=10)
             ttk.Button(btn_frame, text="Save PDF", command=lambda: self.save_as_pdf(filepath)).pack(side=tk.LEFT, padx=10)
+            ttk.Button(btn_frame, text="Close", command=preview.destroy).pack(side=tk.LEFT, padx=10)
         
         except Exception as e:
             messagebox.showerror("Error", f"Gagal memuat file laporan: {str(e)}")
@@ -1591,8 +1678,26 @@ class WasherApp:
             messagebox.showinfo("Save as PDF", f"Laporan akan disimpan sebagai {pdf_path}\n\nPada implementasi nyata, gunakan library PDF converter.")
 
 
-if __name__ == '__main__':
-    root = tk.Tk()
-    app = WasherApp(root)
-    root.mainloop()
-    GPIO.cleanup()
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = WasherApp(root)
+        
+        def cleanup_on_exit():
+            try:
+                GPIO.cleanup()
+            except:
+                pass
+        
+        import atexit
+        atexit.register(cleanup_on_exit)
+        
+        root.protocol("WM_DELETE_WINDOW", lambda: (cleanup_on_exit(), root.destroy()))
+        root.mainloop()
+        
+    except KeyboardInterrupt:
+        print("\nProgram dihentikan oleh user")
+        try:
+            GPIO.cleanup()
+        except:
+            pass
